@@ -1,24 +1,23 @@
 +++
-title = "What’s New in Valkey 9.2: Commands and Options Developers Should Know"
+title = "What’s New in Valkey 9.2 for Application Developers"
 date = 2026-09-15
-description = "Exploring Valkey's new 9.2 commands as well as options developers should know, with practical examples of how to use most of them in your deployment." 
+description = "Exploring a couple of Valkey's 9.2 commands as well as options developers can use to improve their workflow, older commands given new capabilities, and some real life scenarios where they would be useful in your deployment." 
 authors =  ["dragosandriciuc"]
 [taxonomies]
-blog_type = ["Community Highlight"]
+blog_type = ["Technical Deep Dive"]
 +++
 
-<!-- Some Valkey 9.2 features covered here are still under development and their syntax or behavior may change before release. In particular, feedback is welcome on the sections covering MULTIIF, XACKDEL, and other recently proposed command changes -->
+The arrival of Valkey 9.2 adds several changes that make application logic simpler. Instead of handling some conditions in your application code, making extra round trips, or maintaining your own bookkeeping, you can now ask Valkey to perform more of that work directly.
 
-With the arrival of Valkey 9.2, this is a good time to go over some of the new commands that have been added and see what changes they can bring to your deployment. We'll take a look at what these new commands are and give a few examples on how to use them, as well as refreshing your knowledge on some of the already existing commands that haven't been covered from previous releases.
+Let's look at a few of these changes through real application scenarios, from optimistic locking and stream cleanup, to writes that check their own preconditions, to replies that finally tell you what actually happened.
 
-Valkey 9.2 gives applications more precise control over operations and more precise information about their results.
+## `EXEC IFEQ | IFNE | NX | XX` for optimistic-locking workflows
 
-## `MULTIIF` for optimistic-locking workflows
+Let's assume your application tracks account balances, and a transfer needs to update two keys together, but only if the account hasn't been touched by another transfer since your application last read it. This is a classic optimistic-locking pattern. The database reads a version number, then writes only if it hasn't changed.
 
-<!-- The feature is still being finalized: it started life as a dedicated MULTIIF command, but recent core-team discussion is leaning toward folding the conditions into EXEC itself (e.g. EXEC IFEQ key value, EXEC NX key, EXEC XX key). Ask about it's functionality once merged.
--->
+Before 9.2, doing this safely inside a Valkey transaction meant using `WATCH` to watch the version key before you even opened `MULTI`, which costs pipelined clients an extra round trip before they've queued a single command.
 
-Starting off with one of the newest proposed commands added in the 9.2 update, `MULTIIF`. This command allows you to attach transaction preconditions before `EXEC`, avoiding the extra `WATCH` round trip that trips up pipelined clients.
+Valkey 9.2 lets you make `EXEC` itself conditional. You can now attach transaction preconditions directly to `EXEC`, avoiding the extra `WATCH` round trip that trips up pipelined clients.
 
 Consider the following example:
 
@@ -26,7 +25,7 @@ Consider the following example:
 127.0.0.1:6599> WATCH ver{foo}
 127.0.0.1:6599> GET ver{foo}
 127.0.0.1:6599> MULTI
-127.0.0.1:6599> SET ver{foo} <new> IFEQ <old>
+127.0.0.1:6599> SET ver{foo} 2
 127.0.0.1:6599> SET mykey{foo}1 111
 127.0.0.1:6599> SET mykey{foo}2 222
 127.0.0.1:6599> EXEC
@@ -35,11 +34,9 @@ Consider the following example:
 Now with the updated command, you can do:
 
 ```bash
-127.0.0.1:6599> SET ver{foo} 1
-OK
 127.0.0.1:6599> GET ver{foo}
 "1"
-127.0.0.1:6599> MULTIIF ver{foo} EQ 1
+127.0.0.1:6599> MULTI
 OK
 127.0.0.1:6599> SET ver{foo} 2
 QUEUED
@@ -47,64 +44,73 @@ QUEUED
 QUEUED
 127.0.0.1:6599> SET mykey{foo}2 222
 QUEUED
-127.0.0.1:6599> EXEC
+127.0.0.1:6599> EXEC IFEQ ver{foo} 1
 1) OK
 2) OK
 3) OK
 ```
 
-The transaction executes as expected, but the real value of `MULTIIF` shows up when another client changes `ver{foo}` after you've read it but before your `EXEC` runs. With the old `WATCH`-based approach, `WATCH` handles that detection with an extra round trip. However here the same protection comes from the precondition attached at `MULTIIF` time:
+The real value shows up when another client changes `ver{foo}` after you've read it but **before** your `EXEC` runs. With the old `WATCH`-based approach, `WATCH` handles that detection with an extra round trip. Here, the same protection comes from the precondition attached at `EXEC` time:
 
 ```bash
-Client A:  GET ver{foo}
+# Client A:
+127.0.0.1:6599> GET ver{foo}
 "1"
-Client A:  MULTIIF ver{foo} EQ 1
+127.0.0.1:6599> MULTI
 OK
-Client A:  SET ver{foo} 2
+127.0.0.1:6599> SET ver{foo} 2
 QUEUED
-Client A:  SET mykey{foo}1 111
+127.0.0.1:6599> SET mykey{foo}1 111
 QUEUED
-Client A:  SET mykey{foo}2 222
+127.0.0.1:6599> SET mykey{foo}2 222
 QUEUED
-Client B:  SET ver{foo} 99
-OK (a concurrent write sneaks in)
-Client A:  EXEC
+# Client B:
+127.0.0.1:6599> SET ver{foo} 99
+OK   (a concurrent write sneaks in)
+# Client A:
+127.0.0.1:6599> EXEC IFEQ ver{foo} 1
 (nil)
 ```
 
-Because `ver{foo}` no longer equals `1` by the time `EXEC` runs, the entire transaction is discarded: `ver{foo}` is left at Client B's `99`, and neither `mykey{foo}1` nor `mykey{foo}2` is ever written. That's the same safety `WATCH` provides, without the extra round trip to set it up.
+Because `ver{foo}` no longer equals `1` by the time `EXEC` runs, the entire transaction is discarded. That leaves `ver{foo}` at Client B's `99`, and neither `mykey{foo}1` nor `mykey{foo}2` is ever written. For this specific optimistic-locking pattern, that's the same protection `WATCH` provides, without the extra round trip to set it up.
 
-<!-- To add: For more information see the [MULTI command documentation](https://valkey.io/commands/multi/) OR EXEC command link. It's still being discussed. -->
+For more information, see the [EXEC command documentation](https://valkey.io/commands/exec/).
 
-## `XACKDEL` to delete acknowledged messages
+## `XACKDEL` and `XDELEX` for safe cleanup in fan-out stream consumers
 
-<!-- The feature is still being finalized. -->
+Sometimes your application has more than one consumer group independently processing the same stream, one group logging events, another triggering notifications, and so on.
+
+Before 9.2, cleaning up old entries meant either trimming the stream on a schedule and hoping every group had caught up, or writing your own bookkeeping to check every group's pending-entries list before deleting anything. Delete too early, and a slower consumer group loses messages it hasn't processed yet, that data is gone forever.
+
+Valkey 9.2 adds two commands that build that check into the delete itself. `XACKDEL`, which acknowledges a message for one specific group **and** deletes it in the same call, and `XDELEX`, which deletes stream entries directly. Let's look at how both of these work.
+
+### `XACKDEL` to delete acknowledged messages
 
 `XACKDEL` is a stream command that acknowledges one or more messages and (conditionally) deletes them from the stream.
 
-**Note:** This is particularly useful when multiple consumer groups independently process the same stream and you need to reclaim entries without deleting messages that another group still needs.
+This is particularly useful when multiple consumer groups independently process the same stream and you need to reclaim entries without deleting messages that another group still needs.
 
-It works by periodically reclaiming space once messages are acknowledged by all groups. You could use a Lua script that replicates the `XACKDEL` logic, but `XACKDEL` together with `ACKED` mode makes Lua script unnecessary.
+With `ACKED` mode, the message is deleted only once no consumer group still needs it, meaning none has it pending (each has either acknowledged it or never picked it up), and no group can still deliver it later.
 
 The command supports the following deletion modes:
 
 - `KEEPREF` (default, implicit): acknowledges and deletes messages immediately, leaving `PEL` references in other groups
-- `ACKED`: deletes messages only once every consumer group has acknowledged or passed the message, making it safe for fan-out stream topologies, if a message was acknowledged but not deleted then the response is 2
-- `DELREF`: acknowledges, deletes, and forcibly removes PEL entries from all other groups, it shares its deletion semantics with `XDELEX` below, which shows `ACKED` mode in action
+- `DELREF`: acknowledges, deletes, and forcibly removes PEL entries from all other groups
+- `ACKED`: deletes a message only once no consumer group still needs it, meaning none has it pending (each has either acknowledged it or never picked it up), and no group can still deliver it later
 
-## `XDELEX` to delete stream messages
+`XACKDEL` combines acknowledgment and conditional deletion into a single command, whereas `XDELEX` below handles the deletion separately. See `XDELEX`'s example below for `ACKED` mode in action.
 
-<!-- The feature is still being finalized. -->
+### `XDELEX` to delete stream messages
 
 `XDELEX` is an extension of the Valkey Streams [`XDEL` command](https://valkey.io/commands/xdel/) that allows you to delete one or more stream messages with more control over how those message entries are deleted concerning consumer groups.
 
 The command supports three deletion modes:
 
-- `KEEPREF` (default): Deletes the stream entry but leaves PEL references intact in all consumer groups
-- `DELREF`: Deletes the stream entry and forcibly removes it from all consumer group PELs
-- `ACKED`: Only deletes the entry once every consumer group has acknowledged or passed it — safe for fan-out topologies
+- `KEEPREF` (default): deletes the stream entry but leaves PEL references intact in all consumer groups
+- `DELREF`: deletes the stream entry and forcibly removes it from all consumer group PELs
+- `ACKED`: deletes a message only once no consumer group still needs it, meaning none has it pending (each has either acknowledged it or never picked it up), and no group can still deliver it later
 
-**Note:** The command returns a per-ID integer array: 1 for deleted, 2 for exists-but-not-yet-deletable (ACKED mode only), and -1 for not found.
+**Note:** The command returns a per-ID integer array: `1` for deleted, `2` for exists-but-not-yet-deletable (`ACKED` mode only), and `-1` when the message wasn't found, wasn't delivered to the group, or was already acknowledged by it.
 
 Consider the following example of `ACKED` mode in action:
 
@@ -117,7 +123,7 @@ OK
 1) 1) "s4"
     2) 1) 1) "1788346731590-0"
             2) 1) "a"
-                2) "1"
+               2) "1"
 127.0.0.1:6899> XDELEX s4 ACKED IDS 1 1788346731590-0
 1) (integer) 2
 127.0.0.1:6899> XLEN s4
@@ -132,18 +138,15 @@ OK
 
 **Note:** Your `XADD` will return a different ID, ensure you substitute it throughout.
 
-From the above example you can see that the first `XDELEX ... ACKED` call returns `2`, the message still isn't deleted because `grp` hasn't acknowledged it yet, and `XLEN` confirms it's still in the stream. Once `XACK` explicitly acknowledges it for `grp`, the same `XDELEX ... ACKED` call returns `1` and `XLEN` drops to `0` which means the message is only actually removed once every consumer group has acknowledged it.
+From the above example you can see that the first `XDELEX ... ACKED` call returns `2`, because `grp` still has the message pending, and `XLEN` confirms it's still in the stream. Once `XACK` explicitly acknowledges it for `grp`, the same `XDELEX ... ACKED` call returns `1` and `XLEN` drops to `0` which means the message is only actually removed once **no** consumer group still needs it.
 
 ## `MOVE key db [ REPLACE ]` for moving database keys
 
-The `MOVE ...` command moves a key from the currently selected database to the specified destination database. By default, if the key already exists in the destination database, or it doesn't exist in the source database, `MOVE` does nothing.  Because of this it is possible to use `MOVE` as a locking primitive.
+Sometimes your application uses separate logical databases to represent different states of the same data, a staging area versus a live one for example, and it needs to promote a key from one to the other.
+
+Before 9.2, `MOVE` could do that, but only if the destination key didn't already exist. If the key already existed in the destination, `MOVE` silently did nothing, leaving whatever was already there untouched. You'd have to copy the value to the destination yourself and then clean up the source, rather than letting `MOVE` handle the operation.
 
 The new `REPLACE` option, added in 9.2.0, changes that. It tells `MOVE` to overwrite the key in the destination database if one is already present there.
-
-**Note:** You must have access to the current and destination databases.
-
-- Reply `1`: if key was moved
-- Reply `0`: if key wasn't moved, either because it already exists in the destination database (and the `REPLACE` argument wasn't given), or because it doesn't exist in the source database
 
 Consider the following example:
 
@@ -168,36 +171,50 @@ OK
 "active"
 ```
 
-Without `REPLACE`, the first `MOVE` fails silently because `session:42` already exists in database 1. Adding `REPLACE` forces the move, overwriting the `stale` value with the `active` value. For more information see the [MOVE command documentation](https://valkey.io/commands/move/).
+Here we have:
+
+- Reply `1`: if key was moved
+- Reply `0`: if key wasn't moved, either because it already exists in the destination database (and the `REPLACE` argument wasn't given), or because it doesn't exist in the source database
+
+Without `REPLACE`, the first `MOVE` does nothing because `session:42` already exists in database 1. Adding `REPLACE` allows the move to continue, overwriting the `stale` value with the `active` value. For more information, see the [MOVE command documentation](https://valkey.io/commands/move/).
 
 ## `ZRANGE XX` for distinguishing missing keys from empty ranges
 
-`ZRANGE` can't tell you the difference between "this key doesn't exist" and "this key exists but has no members in the requested range". Both of these cases return an empty array. The new `XX` option, added in 9.2.0, fixes that ambiguity. When the key doesn't exist, `ZRANGE ... XX` returns `nil` instead of an empty array.
+Sometimes your application needs to know if a range query came back empty because there was nothing there, or because the key you asked for wasn't there. Before 9.2, `ZRANGE` couldn't distinguish the difference between "this key doesn't exist" and "this key exists but has no members in the requested range".
 
-Consider the following example:
+A leaderboard that's empty because no one has scored yet, and a leaderboard that doesn't exist because you misspelled the key, both come back as the same empty array.
+
+You could use `EXISTS leaderboard:weekly` before every `ZRANGE`, but that's a second round trip for information the server already has at the moment it runs the range query.
+
+With Valkey 9.2, `ZRANGE` gains an `XX` option that surfaces that information directly in the reply:
 
 ```bash
-127.0.0.1:6379> ZADD myset 1 a 2 b 3 c
-(integer) 3
-127.0.0.1:6379> ZRANGE nosuchkey 0 -1
+127.0.0.1:6379> ZADD leaderboard:weekly 100 alice 85 bob
+(integer) 2
+127.0.0.1:6379> ZRANGE leaderboard:weekly 0 -1
+1) "bob"
+2) "alice"
+127.0.0.1:6379> ZRANGE leaderboard:weekly 10 20
 (empty array)
-127.0.0.1:6379> ZRANGE nosuchkey 0 -1 XX
+127.0.0.1:6379> ZRANGE leaderboard:monthly 0 -1
+(empty array)
+127.0.0.1:6379> ZRANGE leaderboard:weekly 10 20 XX
+(empty array)
+127.0.0.1:6379> ZRANGE leaderboard:monthly 0 -1 XX
 (nil)
-127.0.0.1:6379> ZRANGE myset 0 -1 XX
-1) "a"
-2) "b"
-3) "c"
 ```
 
-When the key exists, `XX` has no effect on the result, it only changes the reply when the key is missing entirely (displays `nil`). For more information see the [ZRANGE command documentation](https://valkey.io/commands/zrange/).
+When the key exists, `XX` doesn't change the reply, even when the requested range is empty. When the key is missing, however, `XX` returns `(nil)` instead of an `(empty array)`. Your application can distinguish "the key exists but nothing matched" from "the key doesn't exist" without issuing a separate `EXISTS` call.
+
+For more information, see the [ZRANGE command documentation](https://valkey.io/commands/zrange/).
 
 ## `SET IFNE` to set a key when its value doesn't match a specified value
 
-<!-- The feature is still being finalized. Ask about it's functionality once merged. -->
+Sometimes your application wants to update a value only if it hasn't already been set to something specific, to replace a stale default or placeholder, for example, without touching it if another process has already moved it on.
 
-The `IFNE` option, added in 9.2.0, sets a key only if the current value does not equal the comparison value.
+Before 9.2, doing this safely meant a `GET` first, checking the value in your application code, then conditionally issuing a `SET` for an extra round trip, and a race window between the `GET` and the `SET` where another client could write in between.
 
-Consider the following example:
+With Valkey 9.2, the `IFNE` option lets `SET` do that check itself. It sets a key only if the current value does **not** equal the comparison value, in a single call:
 
 ```bash
 127.0.0.1:6379> SET foo hello
@@ -212,39 +229,47 @@ OK
 "world"
 ```
 
-In this example `SET foo world IFNE goodbye` means "Set foo to world, but only if foo's current value is NOT goodbye." For more information, see the [SET command](https://valkey.io/commands/set/).
+In this example, `SET foo world IFNE goodbye` means "Set foo to world, but only if foo's current value is **NOT** goodbye." Since `foo` is `"hello"`, which isn't `"goodbye"`, the condition passes and the write goes through.
 
-## `SISMEMBER XX` for distinguishing missing keys from empty members
+In the earlier example, `SET foo world IFNE hello` had the opposite outcome. `foo` was already `"hello"`, so the condition failed, the write was skipped, and the reply came back `nil` instead of `OK`. There was no round trip to check the value first, and no window for another client to interleave.
 
-The `SISMEMBER` command returns 1 if a `member` is a member of the set or a 0 if the element is not a member of the set, or if the key doesn't exist. The new addition of XX changes what you get back when the key itself doesn't exist, letting you tell that apart from "the key exists but this member isn't in it", which otherwise both just return 0.
+For more information, see the [SET command](https://valkey.io/commands/set/).
 
-So XX here is a reply-disambiguation flag, `SISMEMBER` still just checks membership either way, but XX unlocks a third possible answer (-1) so you can distinguish "no such key" from "key exists, member absent" without a separate `EXISTS` call.
+## `SISMEMBER XX` for distinguishing missing keys from non-members
 
-Consider the following example:
+Sometimes your application needs to distinguish between "the user isn't in this set" and "the set doesn't exist."
+
+Before 9.2, `SISMEMBER` couldn't distinguish the two cases by itself. For example, if you ran `SISMEMBER users:online alice` you'd get `0`. But what does `0` actually mean? That Alice isn't online? That `users:online` don't exist?
+
+There is no way to tell. You could use `EXISTS users:online` then `SISMEMBER users:online alice` but now you've got another round trip operation, and your application needs to combine two pieces of information together.
+
+With Valkey 9.2, `SISMEMBER` now has an `XX` option that makes that distinction explicit:
 
 ```bash
-127.0.0.1:6379> sadd myset a b c
-(integer) 3
-127.0.0.1:6379> sismember myset a
+127.0.0.1:6379> SADD users:online alice bob
+(integer) 2
+127.0.0.1:6379> SISMEMBER users:online alice XX
 (integer) 1
-127.0.0.1:6379> sismember myset z
+127.0.0.1:6379> SISMEMBER users:online carol XX
 (integer) 0
-127.0.0.1:6379> sismember myset z XX
-(integer) 0
-127.0.0.1:6379> sismember nosuchkey a
-(integer) 0
-127.0.0.1:6379> sismember nosuchkey a XX
+127.0.0.1:6379> SISMEMBER users:offline alice XX
 (integer) -1
 ```
 
-In this example, `SISMEMBER nosuchkey a XX` returns `-1` because the key `nosuchkey` doesn't exist. Without XX, that same call would just return `0`, indistinguishable from a real "not a member" result. For more information, see the [SISMEMBER command](https://valkey.io/commands/sismember/).
+Now your application can distinguish:
+
+- `1` means Alice is a member
+- `0` means the set exists, but the member isn't in it
+- `-1` means the set doesn't exist
+
+This lets applications distinguish missing state from a legitimate non-member result without issuing a separate `EXISTS` command.
+
+For more information, see the [SISMEMBER command](https://valkey.io/commands/sismember/).
 
 ## Try it yourself
 
-<!-- Most of what's covered here is still taking shape some of these commands are proposals working through review, and syntax may shift before they land. But that's exactly why now is a good time to get familiar with the direction Valkey is heading: fewer round trips for transactional workflows, and replies that finally let you tell "empty" apart from "doesn't exist" without extra calls. -->
+Whether you're locking on a version key, cleaning up a fan-out stream, or just tired of `EXISTS` round trips, these new and updated commands improve what application developers can reasonably do with Valkey.
 
-If you're still running an older version of Valkey, this is a good moment to start planning your upgrade path as each release since has closed real gaps like these, and 9.2 looks to continue that trend. In the meantime, you don't have to wait for a tagged release to see this code in action, everything shown here was tested by building Valkey directly from its `unstable` branch, and you can do the same.
+If you're running an older version of Valkey, these examples are a good way to identify application logic that can become simpler after upgrading. [Clone the repository](https://github.com/valkey-io/valkey), check out the relevant branch or commit, build Valkey with `make`, and try the commands for yourself.
 
-Clone the repo, `git fetch` the PR branch you're curious about, `make`, and spin up your own local server!  It's the fastest way to see where these commands stand today and to leave feedback on the PRs themselves before they lock in for good.
-
-Have thoughts on any of these proposals? The GitHub discussions are open, and contributor feedback shapes what ships.
+Have thoughts on any of these features? The [GitHub discussions](https://github.com/orgs/valkey-io/discussions) are open, and contributor feedback shapes what ships.
