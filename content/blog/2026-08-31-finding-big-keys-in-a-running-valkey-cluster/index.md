@@ -2,7 +2,6 @@
 title = "Finding big keys in a running Valkey cluster with Valkey Admin"
 description = "Valkey Admin 1.1 adds big key detection, so you can find the largest keys across every shard of a running cluster from a single view, without parsing an RDB file offline or writing your own SCAN loop."
 date = 2026-09-10
-draft = true
 authors = ["bblan0803", "nassery318"]
 
 [taxonomies]
